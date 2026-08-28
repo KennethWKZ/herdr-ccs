@@ -1,0 +1,248 @@
+#!/bin/sh
+# herdr-ccs — integrate `ccs claude` with Herdr, on top of the built-in Claude Code integration.
+#
+# `ccs claude` wraps Claude Code in the ccs launcher (a proxy/router). Herdr sees the
+# foreground process as `node`/`ccs`, not `claude`, so it neither detects the agent nor
+# resumes it through ccs. This tool fixes both, without disturbing native `claude` use.
+#
+# What it installs:
+#   1. A PATH shim (~/.herdr-shims/claude) that:
+#        - exports HERDR_AGENT=claude so a ccs-wrapped pane is detected as Claude Code
+#        - on `--resume <id>`, routes through `ccs claude --resume` iff <id> was a
+#          ccs-started session, else runs the real claude binary (native stays native)
+#   2. A Claude Code SessionStart hook that tags ccs-started sessions
+#      (detected via ANTHROPIC_AUTH_TOKEN=ccs-internal-managed) under the shim's markers dir.
+#   3. A PATH line in your shell profile so the shim resolves ahead of the real binary.
+#
+# Idempotent and reversible. Fresh `claude` and native `--resume` exec the real binary
+# unchanged, so the shim is transparent for non-ccs use.
+#
+# Usage: herdr-ccs install | uninstall [--purge] | status
+#
+# Env overrides: HERDR_CCS_SHIM_DIR, HERDR_CCS_PROFILE, HERDR_CCS_REAL_CLAUDE, CLAUDE_CONFIG_DIR
+
+set -eu
+
+SHIM_DIR="${HERDR_CCS_SHIM_DIR:-$HOME/.herdr-shims}"
+SHIM="$SHIM_DIR/claude"
+MARK_DIR="$SHIM_DIR/ccs-sessions"
+CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+HOOK="$CFG_DIR/hooks/ccs-session-marker.sh"
+SETTINGS="$CFG_DIR/settings.json"
+HOOK_CMD="bash '$HOOK'"
+BEGIN="# >>> herdr-ccs shim >>>"
+END="# <<< herdr-ccs shim <<<"
+
+log()  { printf '%s\n' "$*"; }
+warn() { printf 'herdr-ccs: %s\n' "$*" >&2; }
+die()  { printf 'herdr-ccs: %s\n' "$*" >&2; exit 1; }
+
+python_bin() {
+  if   command -v python3 >/dev/null 2>&1; then echo python3
+  elif command -v python  >/dev/null 2>&1; then echo python
+  else return 1; fi
+}
+
+# Resolve the real claude binary, never the shim. Prints path on stdout, empty if none.
+detect_real_claude() {
+  for c in "${HERDR_CCS_REAL_CLAUDE:-}" "${CCS_CLAUDE_PATH:-}"; do
+    [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  npmbin=""
+  command -v npm >/dev/null 2>&1 && npmbin="$(npm prefix -g 2>/dev/null)/bin/claude"
+  for c in "$HOME/.local/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude "$npmbin"; do
+    [ -n "$c" ] || continue
+    case "$c" in "$SHIM_DIR"/*) continue ;; esac
+    [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  if command -v which >/dev/null 2>&1; then
+    which -a claude 2>/dev/null | while IFS= read -r c; do
+      case "$c" in "$SHIM_DIR"/*) continue ;; esac
+      [ -x "$c" ] && { printf '%s\n' "$c"; break; }
+    done | head -n1
+  fi
+}
+
+# Resolve the shell profile that a Herdr interactive pane shell will source.
+detect_profile() {
+  if [ -n "${HERDR_CCS_PROFILE:-}" ]; then printf '%s\n' "$HERDR_CCS_PROFILE"; return 0; fi
+  case "$(basename "${SHELL:-}")" in
+    zsh)  printf '%s\n' "$HOME/.zshrc"  ;;
+    bash) printf '%s\n' "$HOME/.bashrc" ;;
+    *)    return 1 ;;
+  esac
+}
+
+write_shim() { # $1 = real claude path
+  real="$1"
+  mkdir -p "$SHIM_DIR" "$MARK_DIR"
+  cat > "$SHIM" <<EOF
+#!/bin/sh
+# Managed by herdr-ccs. Do not edit; run \`herdr-ccs install\` to regenerate.
+REAL="\${HERDR_CCS_REAL_CLAUDE:-$real}"
+MARK_DIR="$MARK_DIR"
+
+id=""; prev=""
+for a in "\$@"; do
+  case "\$prev" in --resume|-r) id="\$a";; esac
+  case "\$a" in --resume=*) id="\${a#--resume=}";; esac
+  prev="\$a"
+done
+
+export HERDR_AGENT=claude   # detected as Claude Code in a Herdr pane; harmless outside
+
+if [ -n "\$id" ] && [ -f "\$MARK_DIR/\$id" ] && command -v ccs >/dev/null 2>&1; then
+  export CCS_CLAUDE_PATH="\$REAL"   # ccs resolves the real binary; never re-enters this shim
+  exec ccs claude "\$@"             # ccs-started session -> resume through ccs
+fi
+exec "\$REAL" "\$@"                  # fresh session, or native session -> real claude
+EOF
+  chmod +x "$SHIM"
+}
+
+write_hook() {
+  mkdir -p "$(dirname "$HOOK")" "$MARK_DIR"
+  cat > "$HOOK" <<EOF
+#!/bin/sh
+# Managed by herdr-ccs. Tags ccs-started Claude Code sessions for launcher-aware restore.
+input="\$(cat)"
+[ "\${ANTHROPIC_AUTH_TOKEN:-}" = "ccs-internal-managed" ] || exit 0
+sid=""
+if command -v python3 >/dev/null 2>&1; then
+  sid="\$(printf '%s' "\$input" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)"
+fi
+[ -n "\$sid" ] || exit 0
+mkdir -p "$MARK_DIR"
+: > "$MARK_DIR/\$sid"
+exit 0
+EOF
+  chmod +x "$HOOK"
+}
+
+patch_settings() { # $1 = add|remove
+  PY="$(python_bin)" || die "python3 required to edit settings.json"
+  [ -f "$SETTINGS" ] || { mkdir -p "$CFG_DIR"; printf '{}\n' > "$SETTINGS"; }
+  cp "$SETTINGS" "$SETTINGS.herdr-ccs.bak"
+  "$PY" - "$1" "$SETTINGS" "$HOOK_CMD" <<'PY'
+import json, sys
+action, path, cmd = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    data = json.load(f)
+hooks = data.setdefault("hooks", {})
+arr = hooks.setdefault("SessionStart", [])
+
+def present():
+    return any(h.get("command") == cmd for g in arr for h in g.get("hooks", []))
+
+if action == "add":
+    if not present():
+        arr.append({"hooks": [{"type": "command", "command": cmd, "timeout": 10}]})
+else:  # remove — strip only our command, preserve any co-located hooks
+    kept = []
+    for g in arr:
+        hs = [h for h in g.get("hooks", []) if h.get("command") != cmd]
+        if hs:
+            g = dict(g); g["hooks"] = hs; kept.append(g)
+    arr[:] = kept
+    if not arr:
+        hooks.pop("SessionStart", None)
+    if not hooks:
+        data.pop("hooks", None)
+
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+}
+
+add_path() { # $1 = profile
+  prof="$1"
+  grep -qF "$BEGIN" "$prof" 2>/dev/null && return 0
+  { printf '\n%s\n' "$BEGIN"
+    printf 'export PATH="%s:$PATH"\n' "$SHIM_DIR"
+    printf '%s\n' "$END"
+  } >> "$prof"
+}
+
+remove_path() { # $1 = profile
+  prof="$1"
+  [ -f "$prof" ] || return 0
+  tmp="$(mktemp)"
+  awk -v b="$BEGIN" -v e="$END" '
+    $0==b { skip=1; next }
+    $0==e { skip=0; next }
+    skip!=1 { print }
+  ' "$prof" > "$tmp"
+  cat "$tmp" > "$prof"
+  rm -f "$tmp"
+}
+
+herdr_precheck() {
+  command -v herdr >/dev/null 2>&1 || { warn "herdr not found on PATH — install Herdr first"; return; }
+  herdr integration status 2>/dev/null | grep -qi claude \
+    || warn "Herdr's Claude integration may be missing — run: herdr integration install claude"
+}
+
+cmd_install() {
+  real="$(detect_real_claude || true)"
+  [ -n "$real" ] || die "could not locate the real 'claude' binary; set HERDR_CCS_REAL_CLAUDE=/path/to/claude"
+  prof="$(detect_profile)" || die "unsupported shell '${SHELL:-?}'. Set HERDR_CCS_PROFILE=/path/to/profile (POSIX 'export PATH' syntax), or add '$SHIM_DIR' to PATH manually."
+  command -v ccs >/dev/null 2>&1 || warn "'ccs' not on PATH — ccs-session resume will fall back to native claude"
+  write_shim "$real"
+  write_hook
+  patch_settings add
+  add_path "$prof"
+  herdr_precheck
+  log "installed."
+  log "  shim:        $SHIM  (real claude: $real)"
+  log "  marker hook: $HOOK"
+  log "  settings:    $SETTINGS  (backup: $SETTINGS.herdr-ccs.bak)"
+  log "  profile:     $prof  (PATH block appended)"
+  log ""
+  log "next: open a new shell (or: source '$prof'), then verify:"
+  log "  which claude   # expect: $SHIM"
+}
+
+cmd_uninstall() {
+  purge=0
+  [ "${1:-}" = "--purge" ] && purge=1
+  [ -f "$SETTINGS" ] && patch_settings remove || true
+  prof="$(detect_profile 2>/dev/null || true)"
+  if [ -n "$prof" ]; then
+    remove_path "$prof"
+  else
+    warn "shell profile not auto-detected; remove the '$BEGIN' block manually if present"
+  fi
+  rm -f "$SHIM" "$HOOK"
+  if [ "$purge" -eq 1 ]; then
+    rm -rf "$MARK_DIR"
+    rmdir "$SHIM_DIR" 2>/dev/null || true
+    log "uninstalled (purged shim dir + session markers)."
+  else
+    log "uninstalled. session markers kept at $MARK_DIR (use --purge to remove)."
+  fi
+  [ -n "$prof" ] && log "reload your shell so PATH drops the shim: source '$prof' (or open a new shell)."
+}
+
+cmd_status() {
+  mark() { if [ -n "$1" ]; then log "  [ok]  $2"; else log "  [--]  $2"; fi; }
+  real="$(detect_real_claude || true)"
+  prof="$(detect_profile 2>/dev/null || echo '(unsupported shell)')"
+  log "herdr-ccs status:"
+  mark "$( [ -x "$SHIM" ] && echo x || true )"                          "shim            $SHIM"
+  mark "$( [ -x "$HOOK" ] && echo x || true )"                          "marker hook     $HOOK"
+  mark "$( grep -qF "$HOOK" "$SETTINGS" 2>/dev/null && echo x || true )" "SessionStart    $SETTINGS"
+  mark "$( grep -qF "$BEGIN" "$prof" 2>/dev/null && echo x || true )"    "profile PATH    $prof"
+  mark "$( [ -n "$real" ] && echo x || true )"                          "real claude     ${real:-not found}"
+  mark "$( command -v ccs >/dev/null 2>&1 && echo x || true )"          "ccs on PATH"
+  n="$( ls -1 "$MARK_DIR" 2>/dev/null | wc -l | tr -d ' ' )"
+  log "  info  tagged ccs sessions: ${n:-0}"
+  log "  info  'claude' resolves here to: $(command -v claude 2>/dev/null || echo none)"
+}
+
+case "${1:-}" in
+  install)   cmd_install ;;
+  uninstall) shift 2>/dev/null || true; cmd_uninstall "${1:-}" ;;
+  status)    cmd_status ;;
+  *) die "usage: herdr-ccs install | uninstall [--purge] | status" ;;
+esac

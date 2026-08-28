@@ -1,0 +1,32 @@
+# Herdr plugin manifest. Makes herdr-ccs installable via:
+#   herdr plugin install kennethwkz/herdr-ccs
+# and discoverable in the marketplace (tag the GitHub repo topic `herdr-plugin`).
+#
+# The actions below invoke the bundled CLI (bin/herdr-ccs). Herdr runs plugin
+# commands with the plugin directory as the working directory, so the relative
+# path resolves. `sh` is used explicitly so the file's executable bit is not required.
+
+id = "kennethwkz.herdr-ccs"
+name = "herdr-ccs"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Make `ccs claude` behave like native Claude Code in Herdr: pane detection + launcher-aware session restore through ccs."
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "install"
+title = "herdr-ccs: install"
+contexts = ["workspace"]
+command = ["sh", "bin/herdr-ccs", "install"]
+
+[[actions]]
+id = "uninstall"
+title = "herdr-ccs: uninstall"
+contexts = ["workspace"]
+command = ["sh", "bin/herdr-ccs", "uninstall"]
+
+[[actions]]
+id = "status"
+title = "herdr-ccs: status"
+contexts = ["workspace"]
+command = ["sh", "bin/herdr-ccs", "status"]
