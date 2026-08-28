@@ -6,12 +6,17 @@ Integrate [`ccs claude`](https://www.npmjs.com/package/@kaitranntt/ccs) with
 ## Why
 
 `ccs claude` runs Claude Code inside the **ccs** launcher (a proxy/router). Because the
-foreground process in the pane is `node`/`ccs` rather than `claude`, Herdr:
+foreground process in the pane is `node`/`ccs` rather than `claude`, Herdr may not detect
+the pane as Claude Code (no live `working`/`idle`/`blocked` state).
 
-- may not detect the pane as Claude Code (no live `working`/`idle`/`blocked` state), and
-- on restore, relaunches the **canonical `claude` binary** — bypassing ccs and its proxy.
+Restore is more nuanced. Herdr's **restart-restore** (server restart / after reboot) replays
+each pane's original foreground command, so ccs panes already come back as
+`ccs claude --resume <id>` — through ccs — on their own. But Herdr's **canonical resume**
+path (an agent-level resume / `agent start --kind claude`) relaunches the bare `claude`
+binary, which would bypass ccs.
 
-`herdr-ccs` fixes both, while leaving native `claude` untouched.
+`herdr-ccs` closes the detection gap and makes the canonical-resume path launcher-aware,
+while leaving native `claude` untouched.
 
 ## What it does
 
@@ -74,8 +79,8 @@ herdr-ccs status             # "tagged ccs sessions: 1"
 # a bare `claude` session is not tagged -> restores natively
 ```
 
-On your first Herdr restore of a ccs session, confirm the pane comes back as `node`/`ccs`
-(i.e. routed through ccs), not bare `claude`.
+After a Herdr restart, confirm a restored ccs pane runs through ccs — its process tree
+shows `ccs claude --resume <id>` → `claude --settings …/ccs-launch-settings-… --resume <id>`.
 
 ## Uninstall
 
@@ -100,11 +105,20 @@ Environment overrides (all optional):
 
 ## How restore works
 
-Herdr's Claude integration stores a native session id and, on restart, relaunches the
-canonical `claude` binary — it has no per-session memory of the launcher. `herdr-ccs`
-adds that memory: the `SessionStart` marker records which sessions were ccs-started, and
-the shim consults it when Herdr runs `claude --resume <id>`, redirecting only those to
-`ccs claude --resume <id>`.
+Herdr has two resume paths:
+
+- **Restart-restore** (server restart / reboot): Herdr replays each pane's original
+  foreground command. ccs panes were launched as `ccs claude`, so they are restored as
+  `ccs claude --resume <id>` — already through ccs, with no help from this tool.
+  (Verified: after a reboot, restored panes run `ccs claude --resume` → real `claude`
+  with ccs's `--settings`, even with an empty marker set.)
+- **Canonical resume** (agent-level resume / `agent start --kind claude`): Herdr launches
+  the bare `claude` binary, which has no memory of the launcher and would bypass ccs.
+
+`herdr-ccs` is the safety net for the second path. The `SessionStart` marker records which
+sessions were ccs-started; the shim consults it when something runs `claude --resume <id>`
+and redirects only tagged sessions to `ccs claude --resume <id>`. It also fixes detection
+via `HERDR_AGENT=claude`.
 
 ## Caveats
 
