@@ -12,7 +12,9 @@
 #          ccs-started session, else runs the real claude binary (native stays native)
 #   2. A Claude Code SessionStart hook that tags ccs-started sessions
 #      (detected via ANTHROPIC_AUTH_TOKEN=ccs-internal-managed) under the shim's markers dir.
-#   3. A PATH line in your shell profile so the shim resolves ahead of the real binary.
+#   3. Two lines in your shell profile: a PATH line so the shim resolves ahead of the real
+#      binary, and a CCS_CLAUDE_PATH export that pins ccs to the real claude — so a direct
+#      `ccs claude --resume` finds it in one hop instead of bouncing back through the shim.
 #
 # Idempotent and reversible. Fresh `claude` and native `--resume` exec the real binary
 # unchanged, so the shim is transparent for non-ccs use.
@@ -36,6 +38,16 @@ END="# <<< herdr-ccs shim <<<"
 log()  { printf '%s\n' "$*"; }
 warn() { printf 'herdr-ccs: %s\n' "$*" >&2; }
 die()  { printf 'herdr-ccs: %s\n' "$*" >&2; exit 1; }
+
+# Rewrite a path under $HOME as a literal "$HOME/..." string, so lines written into a shell
+# profile stay portable across machines/dotfile repos instead of baking an absolute home path.
+homeify() { # $1 = absolute path
+  case "$1" in
+    "$HOME"/*) printf '$HOME/%s\n' "${1#"$HOME"/}" ;;
+    "$HOME")   printf '$HOME\n' ;;
+    *)         printf '%s\n' "$1" ;;
+  esac
+}
 
 python_bin() {
   if   command -v python3 >/dev/null 2>&1; then echo python3
@@ -155,11 +167,18 @@ with open(path, "w") as f:
 PY
 }
 
-add_path() { # $1 = profile
-  prof="$1"
-  grep -qF "$BEGIN" "$prof" 2>/dev/null && return 0
+add_path() { # $1 = profile, $2 = real claude path
+  prof="$1"; real="$2"
+  shim_disp="$(homeify "$SHIM_DIR")"
+  real_disp="$(homeify "$real")"
+  if grep -qF "$BEGIN" "$prof" 2>/dev/null; then
+    # Block present. Ensure the CCS_CLAUDE_PATH export exists; refresh a pre-export block if not.
+    grep -qF 'export CCS_CLAUDE_PATH=' "$prof" 2>/dev/null && return 0
+    remove_path "$prof"
+  fi
   { printf '\n%s\n' "$BEGIN"
-    printf 'export PATH="%s:$PATH"\n' "$SHIM_DIR"
+    printf 'export PATH="%s:$PATH"\n' "$shim_disp"
+    printf 'export CCS_CLAUDE_PATH="%s"\n' "$real_disp"
     printf '%s\n' "$END"
   } >> "$prof"
 }
@@ -191,13 +210,13 @@ cmd_install() {
   write_shim "$real"
   write_hook
   patch_settings add
-  add_path "$prof"
+  add_path "$prof" "$real"
   herdr_precheck
   log "installed."
   log "  shim:        $SHIM  (real claude: $real)"
   log "  marker hook: $HOOK"
   log "  settings:    $SETTINGS  (backup: $SETTINGS.herdr-ccs.bak)"
-  log "  profile:     $prof  (PATH block appended)"
+  log "  profile:     $prof  (PATH + CCS_CLAUDE_PATH block appended)"
   log ""
   log "next: open a new shell (or: source '$prof'), then verify:"
   log "  which claude   # expect: $SHIM"
@@ -233,6 +252,7 @@ cmd_status() {
   mark "$( [ -x "$HOOK" ] && echo x || true )"                          "marker hook     $HOOK"
   mark "$( grep -qF "$HOOK" "$SETTINGS" 2>/dev/null && echo x || true )" "SessionStart    $SETTINGS"
   mark "$( grep -qF "$BEGIN" "$prof" 2>/dev/null && echo x || true )"    "profile PATH    $prof"
+  mark "$( grep -qF 'export CCS_CLAUDE_PATH=' "$prof" 2>/dev/null && echo x || true )" "profile ENV     CCS_CLAUDE_PATH pin"
   mark "$( [ -n "$real" ] && echo x || true )"                          "real claude     ${real:-not found}"
   mark "$( command -v ccs >/dev/null 2>&1 && echo x || true )"          "ccs on PATH"
   n="$( ls -1 "$MARK_DIR" 2>/dev/null | wc -l | tr -d ' ' )"
