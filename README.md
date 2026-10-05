@@ -20,18 +20,24 @@ while leaving native `claude` untouched.
 
 ## What it does
 
-1. **PATH shim** (`~/.herdr-shims/claude`)
+1. **`claude` PATH shim** (`~/.herdr-shims/claude`)
    - exports `HERDR_AGENT=claude` so a ccs-wrapped pane uses Claude Code's screen manifest
      (Herdr's documented mechanism for wrapper-hidden agents), and
-   - on `--resume <id>`, routes through `ccs claude --resume` **iff** `<id>` was a
-     ccs-started session; otherwise runs the real `claude`. Native sessions stay native.
-2. **Claude Code `SessionStart` hook** that tags ccs-started sessions. ccs sets
-   `ANTHROPIC_AUTH_TOKEN=ccs-internal-managed`; the hook records the session id under the
-   shim's markers dir. Bare `claude` never sets that token, so tagging is unambiguous.
-3. **Shell-profile `PATH` line** so the shim resolves ahead of the real binary.
+   - on `--resume <id>`, routes through `ccs <profile> [--browser] --resume` **iff** `<id>`
+     was a ccs-started session; otherwise runs the real `claude`. Native sessions stay native.
+2. **`ccs` PATH shim** (`~/.herdr-shims/ccs`) that starts the ccs-managed Chrome before a
+   `--browser` launch. ccs only exposes its browser MCP tools (Claude Browser Attach) when
+   Chrome already answers on the DevTools port at launch, and never starts Chrome itself —
+   so without this, `ccs claude --browser` with Chrome closed silently comes up with no
+   browser tools. Every other invocation passes straight through to the real `ccs`.
+3. **Claude Code `SessionStart` hook** that tags ccs-started sessions. ccs sets
+   `ANTHROPIC_AUTH_TOKEN=ccs-internal-managed`; the hook writes a marker named after the
+   session id, holding the ccs profile (`profile=claude`) and, when browser tools were live,
+   `browser=1`. Bare `claude` never sets that token, so tagging is unambiguous.
+4. **Shell-profile `PATH` line** so the shims resolve ahead of the real binaries.
 
-The shim is transparent for non-ccs use: a fresh `claude`, and a native `--resume`, `exec`
-the real binary unchanged.
+The shims are transparent for non-ccs use: a fresh `claude`, a native `--resume`, and any
+`ccs` call without `--browser` `exec` the real binary unchanged.
 
 ## Requirements
 
@@ -75,8 +81,13 @@ which claude                 # expect: ~/.herdr-shims/claude
 herdr-ccs status
 # start a ccs session, then check it was tagged:
 ccs claude
-herdr-ccs status             # "tagged ccs sessions: 1"
+herdr-ccs status             # "tagged ccs sessions: 1 (with browser: 0)"
 # a bare `claude` session is not tagged -> restores natively
+
+# browser: with Chrome closed, this starts it first, then ccs exposes the browser tools
+ccs claude --browser
+ccs browser status           # "State: ready"
+herdr-ccs status             # "(with browser: 1)"
 ```
 
 After a Herdr restart, confirm a restored ccs pane runs through ccs — its process tree
@@ -117,8 +128,22 @@ Herdr has two resume paths:
 
 `herdr-ccs` is the safety net for the second path. The `SessionStart` marker records which
 sessions were ccs-started; the shim consults it when something runs `claude --resume <id>`
-and redirects only tagged sessions to `ccs claude --resume <id>`. It also fixes detection
-via `HERDR_AGENT=claude`.
+and redirects only tagged sessions to `ccs <profile> --resume <id>`, adding `--browser` when
+the marker says browser tools were live. It also fixes detection via `HERDR_AGENT=claude`.
+
+Browser sessions come back with their tools on either path: a resume that reaches `ccs` with
+`--browser` goes through the `ccs` shim, which starts Chrome if it isn't running. Markers
+written before profile capture are empty and resume as `ccs claude`, exactly as before.
+
+### Browser settings
+
+The `ccs` shim reads the same settings ccs does, with the same precedence: the
+`CCS_BROWSER_USER_DATA_DIR` / `CCS_BROWSER_DEVTOOLS_PORT` env overrides, then
+`browser.claude` in `config.yaml` (under `CCS_DIR`, `CCS_HOME/.ccs`, or `~/.ccs`), then port
+`9222`. It skips the launch when `browser.claude.enabled` is `false`, and refuses to start
+Chrome when no `user_data_dir` is configured — ccs would then fall back to your everyday
+Chrome profile, which should not be opened to DevTools unattended. Run `ccs browser setup`
+once to create the managed profile.
 
 ## Caveats
 
@@ -128,7 +153,16 @@ via `HERDR_AGENT=claude`.
   command to an interactive login pane shell, which sources your profile). If a future
   Herdr version pins an absolute path, the shim will not intercept restore.
 - The ccs detection token (`ANTHROPIC_AUTH_TOKEN=ccs-internal-managed`) is a ccs
-  implementation detail; if ccs changes it, update the marker hook.
+  implementation detail; if ccs changes it, update the marker hook. The same goes for
+  `CCS_BROWSER_DEVTOOLS_HTTP_URL`, which the hook reads as "browser tools were live".
+- ccs exports no profile name, so the hook reads it from the launching `ccs <profile> …`
+  process (the first bare word after the ccs binary). If it can't, the marker has no
+  profile and resume falls back to `ccs claude`.
+- The marker reflects the latest launch of a session: resuming a browser session while
+  Chrome can't start rewrites it without `browser=1`.
+- Restoring a browser session starts Chrome with its DevTools port open on `127.0.0.1`,
+  with no one at the keyboard. Any local process can drive that Chrome profile while it
+  runs; keep sensitive logins out of it and quit it when done.
 
 ## License
 

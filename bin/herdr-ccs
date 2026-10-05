@@ -8,12 +8,16 @@
 # What it installs:
 #   1. A PATH shim (~/.herdr-shims/claude) that:
 #        - exports HERDR_AGENT=claude so a ccs-wrapped pane is detected as Claude Code
-#        - on `--resume <id>`, routes through `ccs claude --resume` iff <id> was a
-#          ccs-started session, else runs the real claude binary (native stays native)
-#   2. A Claude Code SessionStart hook that tags ccs-started sessions
-#      (detected via ANTHROPIC_AUTH_TOKEN=ccs-internal-managed) under the shim's markers dir.
-#   3. Two lines in your shell profile: a PATH line so the shim resolves ahead of the real
-#      binary, and a CCS_CLAUDE_PATH export that pins ccs to the real claude — so a direct
+#        - on `--resume <id>`, routes through `ccs <profile> [--browser] --resume` iff <id>
+#          was a ccs-started session, else runs the real claude binary (native stays native)
+#   2. A PATH shim (~/.herdr-shims/ccs) that starts the ccs-managed Chrome before a
+#      `--browser` launch. ccs only exposes its browser MCP tools when Chrome already
+#      answers on the DevTools port at launch, and never starts Chrome itself.
+#   3. A Claude Code SessionStart hook that tags ccs-started sessions
+#      (detected via ANTHROPIC_AUTH_TOKEN=ccs-internal-managed) under the shim's markers dir,
+#      recording the ccs profile and whether browser tools were live, so resume replays both.
+#   4. Two lines in your shell profile: a PATH line so the shims resolve ahead of the real
+#      binaries, and a CCS_CLAUDE_PATH export that pins ccs to the real claude — so a direct
 #      `ccs claude --resume` finds it in one hop instead of bouncing back through the shim.
 #
 # Idempotent and reversible. Fresh `claude` and native `--resume` exec the real binary
@@ -27,6 +31,7 @@ set -eu
 
 SHIM_DIR="${HERDR_CCS_SHIM_DIR:-$HOME/.herdr-shims}"
 SHIM="$SHIM_DIR/claude"
+CCS_SHIM="$SHIM_DIR/ccs"
 MARK_DIR="$SHIM_DIR/ccs-sessions"
 CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 HOOK="$CFG_DIR/hooks/ccs-session-marker.sh"
@@ -75,6 +80,15 @@ detect_real_claude() {
   fi
 }
 
+# Resolve the real ccs on PATH, never the shim. Prints path on stdout, empty if none.
+detect_real_ccs() {
+  command -v which >/dev/null 2>&1 || return 0
+  which -a ccs 2>/dev/null | while IFS= read -r c; do
+    case "$c" in "$SHIM_DIR"/*) continue ;; esac
+    [ -x "$c" ] && { printf '%s\n' "$c"; break; }
+  done | head -n1
+}
+
 # Resolve the shell profile that a Herdr interactive pane shell will source.
 detect_profile() {
   if [ -n "${HERDR_CCS_PROFILE:-}" ]; then printf '%s\n' "$HERDR_CCS_PROFILE"; return 0; fi
@@ -105,29 +119,149 @@ export HERDR_AGENT=claude   # detected as Claude Code in a Herdr pane; harmless 
 
 if [ -n "\$id" ] && [ -f "\$MARK_DIR/\$id" ] && command -v ccs >/dev/null 2>&1; then
   export CCS_CLAUDE_PATH="\$REAL"   # ccs resolves the real binary; never re-enters this shim
-  exec ccs claude "\$@"             # ccs-started session -> resume through ccs
+  # Markers written before profile capture are empty: resume them as \`ccs claude\`, as before.
+  profile="\$(sed -n 's/^profile=//p' "\$MARK_DIR/\$id" | head -n1)"
+  if grep -qx 'browser=1' "\$MARK_DIR/\$id"; then
+    exec ccs "\${profile:-claude}" --browser "\$@"
+  fi
+  exec ccs "\${profile:-claude}" "\$@"
 fi
 exec "\$REAL" "\$@"                  # fresh session, or native session -> real claude
 EOF
   chmod +x "$SHIM"
 }
 
+write_ccs_shim() {
+  mkdir -p "$SHIM_DIR"
+  { printf '#!/bin/sh\n# Managed by herdr-ccs. Do not edit; run `herdr-ccs install` to regenerate.\n'
+    printf "SHIM_DIR='%s'\n" "$SHIM_DIR"
+    cat <<'EOF'
+# ccs only exposes its browser MCP tools when Chrome already answers on the DevTools port at
+# launch, and never starts Chrome itself — so bring the managed Chrome up before a
+# `--browser` launch. Everything else passes straight through to the real ccs.
+
+real=""
+ifs=$IFS; IFS=:; set -f
+for d in $PATH; do
+  case "$d" in ''|"$SHIM_DIR") continue ;; esac
+  [ -x "$d/ccs" ] && ! [ "$d/ccs" -ef "$0" ] && { real="$d/ccs"; break; }
+done
+IFS=$ifs; set +f
+[ -n "$real" ] || { echo "herdr-ccs: no real ccs found on PATH" >&2; exit 127; }
+
+# Same precedence as ccs: CCS_DIR, then CCS_HOME/.ccs, then ~/.ccs.
+ccs_dir="${CCS_DIR:-${CCS_HOME:+$CCS_HOME/.ccs}}"
+ccs_dir="${ccs_dir:-$HOME/.ccs}"
+
+cfg_value() { # $1 = key under browser.claude in config.yaml
+  [ -f "$ccs_dir/config.yaml" ] || return 0
+  awk -v key="$1:" '
+    /^[^[:space:]#]/ { b = ($0 ~ /^browser:/); c = 0; next }
+    b && /^  [^[:space:]#]/ { c = ($0 ~ /^  claude:/); next }
+    b && c && $1 == key { sub(/^[^:]*:[[:space:]]*/, ""); gsub(/^["\047]|["\047]$/, ""); print; exit }
+  ' "$ccs_dir/config.yaml"
+}
+
+launch_chrome() { # $1 = port, $2 = user-data dir
+  case "$(uname -s)" in
+    Darwin) open -gna "Google Chrome" --args --remote-debugging-port="$1" --user-data-dir="$2" ;;
+    *)
+      for b in google-chrome google-chrome-stable chromium chromium-browser; do
+        command -v "$b" >/dev/null 2>&1 || continue
+        nohup "$b" --remote-debugging-port="$1" --user-data-dir="$2" >/dev/null 2>&1 &
+        return 0
+      done
+      return 1
+      ;;
+  esac
+}
+
+ensure_browser() {
+  [ "$(cfg_value enabled)" = "false" ] && return 0
+  command -v curl >/dev/null 2>&1 || { echo "herdr-ccs: curl not found; not starting Chrome" >&2; return 0; }
+  dir="${CCS_BROWSER_USER_DATA_DIR:-${CCS_BROWSER_PROFILE_DIR:-$(cfg_value user_data_dir)}}"
+  port="${CCS_BROWSER_DEVTOOLS_PORT:-$(cfg_value devtools_port)}"
+  port="${port:-9222}"
+  case "$dir" in "~"/*) dir="$HOME/${dir#"~/"}" ;; esac
+  probe="http://127.0.0.1:$port/json/version"
+
+  curl -sf -m 1 "$probe" >/dev/null 2>&1 && return 0
+  # With no managed dir ccs falls back to your everyday Chrome profile; never open that one
+  # to DevTools unattended.
+  if [ -z "$dir" ]; then
+    echo "herdr-ccs: no browser user_data_dir configured; run \`ccs browser setup\`" >&2
+    return 0
+  fi
+  launch_chrome "$port" "$dir" || { echo "herdr-ccs: could not start Chrome" >&2; return 0; }
+  i=0
+  while [ "$i" -lt 40 ]; do
+    curl -sf -m 1 "$probe" >/dev/null 2>&1 && return 0
+    sleep 0.25
+    i=$((i + 1))
+  done
+  echo "herdr-ccs: Chrome did not answer on 127.0.0.1:$port within 10s; browser tools will be missing" >&2
+}
+
+for a in "$@"; do
+  case "$a" in
+    --) break ;;
+    --browser) ensure_browser; break ;;
+  esac
+done
+exec "$real" "$@"
+EOF
+  } > "$CCS_SHIM"
+  chmod +x "$CCS_SHIM"
+}
+
 write_hook() {
   mkdir -p "$(dirname "$HOOK")" "$MARK_DIR"
-  cat > "$HOOK" <<EOF
-#!/bin/sh
-# Managed by herdr-ccs. Tags ccs-started Claude Code sessions for launcher-aware restore.
-input="\$(cat)"
-[ "\${ANTHROPIC_AUTH_TOKEN:-}" = "ccs-internal-managed" ] || exit 0
+  { printf '#!/bin/sh\n# Managed by herdr-ccs. Tags ccs-started Claude Code sessions for launcher-aware restore.\n'
+    printf "MARK_DIR='%s'\n" "$MARK_DIR"
+    cat <<'EOF'
+input="$(cat)"
+[ "${ANTHROPIC_AUTH_TOKEN:-}" = "ccs-internal-managed" ] || exit 0
 sid=""
 if command -v python3 >/dev/null 2>&1; then
-  sid="\$(printf '%s' "\$input" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)"
+  sid="$(printf '%s' "$input" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)"
 fi
-[ -n "\$sid" ] || exit 0
+[ -n "$sid" ] || exit 0
+
+# ccs exports no profile name, so read it off the launching `ccs <profile> ...` process.
+# Only argv[0]/argv[1] count as the ccs binary: claude's own argv carries free text.
+ccs_profile() {
+  pid=$PPID
+  for _ in 1 2 3 4 5 6 7 8; do
+    case "$pid" in ''|0|1) return 0 ;; esac
+    set -f
+    # shellcheck disable=SC2046
+    set -- $(ps -o args= -p "$pid" 2>/dev/null)
+    set +f
+    case "${1:-}" in
+      ccs|*/ccs) shift ;;
+      *) case "${2:-}" in
+           ccs|*/ccs) shift 2 ;;
+           *) pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"; continue ;;
+         esac ;;
+    esac
+    for a in "$@"; do
+      case "$a" in -*) ;; *) printf '%s\n' "$a"; return 0 ;; esac
+    done
+    return 0
+  done
+}
+
+profile="$(ccs_profile)"
+case "$profile" in *[!A-Za-z0-9._-]*) profile="" ;; esac
+
 mkdir -p "$MARK_DIR"
-: > "$MARK_DIR/\$sid"
+{ [ -z "$profile" ] || printf 'profile=%s\n' "$profile"
+  # Set by ccs only when the browser MCP was actually exposed to this session.
+  [ -z "${CCS_BROWSER_DEVTOOLS_HTTP_URL:-}" ] || printf 'browser=1\n'
+} > "$MARK_DIR/$sid"
 exit 0
 EOF
+  } > "$HOOK"
   chmod +x "$HOOK"
 }
 
@@ -138,7 +272,7 @@ patch_settings() { # $1 = add|remove
   "$PY" - "$1" "$SETTINGS" "$HOOK_CMD" <<'PY'
 import json, sys
 action, path, cmd = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(path) as f:
+with open(path, encoding="utf-8") as f:
     data = json.load(f)
 hooks = data.setdefault("hooks", {})
 arr = hooks.setdefault("SessionStart", [])
@@ -161,8 +295,8 @@ else:  # remove — strip only our command, preserve any co-located hooks
     if not hooks:
         data.pop("hooks", None)
 
-with open(path, "w") as f:
-    json.dump(data, f, indent=2)
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
 PY
 }
@@ -206,14 +340,16 @@ cmd_install() {
   real="$(detect_real_claude || true)"
   [ -n "$real" ] || die "could not locate the real 'claude' binary; set HERDR_CCS_REAL_CLAUDE=/path/to/claude"
   prof="$(detect_profile)" || die "unsupported shell '${SHELL:-?}'. Set HERDR_CCS_PROFILE=/path/to/profile (POSIX 'export PATH' syntax), or add '$SHIM_DIR' to PATH manually."
-  command -v ccs >/dev/null 2>&1 || warn "'ccs' not on PATH — ccs-session resume will fall back to native claude"
+  [ -n "$(detect_real_ccs)" ] || warn "'ccs' not on PATH — install ccs before starting ccs sessions"
   write_shim "$real"
+  write_ccs_shim
   write_hook
   patch_settings add
   add_path "$prof" "$real"
   herdr_precheck
   log "installed."
   log "  shim:        $SHIM  (real claude: $real)"
+  log "  ccs shim:    $CCS_SHIM  (starts Chrome for --browser)"
   log "  marker hook: $HOOK"
   log "  settings:    $SETTINGS  (backup: $SETTINGS.herdr-ccs.bak)"
   log "  profile:     $prof  (PATH + CCS_CLAUDE_PATH block appended)"
@@ -232,7 +368,7 @@ cmd_uninstall() {
   else
     warn "shell profile not auto-detected; remove the '$BEGIN' block manually if present"
   fi
-  rm -f "$SHIM" "$HOOK"
+  rm -f "$SHIM" "$CCS_SHIM" "$HOOK"
   if [ "$purge" -eq 1 ]; then
     rm -rf "$MARK_DIR"
     rmdir "$SHIM_DIR" 2>/dev/null || true
@@ -246,17 +382,20 @@ cmd_uninstall() {
 cmd_status() {
   mark() { if [ -n "$1" ]; then log "  [ok]  $2"; else log "  [--]  $2"; fi; }
   real="$(detect_real_claude || true)"
+  real_ccs="$(detect_real_ccs)"
   prof="$(detect_profile 2>/dev/null || echo '(unsupported shell)')"
   log "herdr-ccs status:"
   mark "$( [ -x "$SHIM" ] && echo x || true )"                          "shim            $SHIM"
+  mark "$( [ -x "$CCS_SHIM" ] && echo x || true )"                      "ccs shim        $CCS_SHIM"
   mark "$( [ -x "$HOOK" ] && echo x || true )"                          "marker hook     $HOOK"
   mark "$( grep -qF "$HOOK" "$SETTINGS" 2>/dev/null && echo x || true )" "SessionStart    $SETTINGS"
   mark "$( grep -qF "$BEGIN" "$prof" 2>/dev/null && echo x || true )"    "profile PATH    $prof"
   mark "$( grep -qF 'export CCS_CLAUDE_PATH=' "$prof" 2>/dev/null && echo x || true )" "profile ENV     CCS_CLAUDE_PATH pin"
   mark "$( [ -n "$real" ] && echo x || true )"                          "real claude     ${real:-not found}"
-  mark "$( command -v ccs >/dev/null 2>&1 && echo x || true )"          "ccs on PATH"
+  mark "$real_ccs"                                                      "real ccs        ${real_ccs:-not found}"
   n="$( ls -1 "$MARK_DIR" 2>/dev/null | wc -l | tr -d ' ' )"
-  log "  info  tagged ccs sessions: ${n:-0}"
+  nb="$( grep -lx 'browser=1' "$MARK_DIR"/* 2>/dev/null | wc -l | tr -d ' ' )"
+  log "  info  tagged ccs sessions: ${n:-0} (with browser: ${nb:-0})"
   log "  info  'claude' resolves here to: $(command -v claude 2>/dev/null || echo none)"
 }
 
