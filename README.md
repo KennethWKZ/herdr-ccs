@@ -29,7 +29,9 @@ while leaving native `claude` untouched.
    `--browser` launch. ccs only exposes its browser MCP tools (Claude Browser Attach) when
    Chrome already answers on the DevTools port at launch, and never starts Chrome itself —
    so without this, `ccs claude --browser` with Chrome closed silently comes up with no
-   browser tools. Every other invocation passes straight through to the real `ccs`.
+   browser tools. When the last `--browser` session using that Chrome exits, the shim quits
+   it again, so the DevTools port doesn't stay open. Every other invocation passes straight
+   through to the real `ccs`.
 3. **Claude Code `SessionStart` hook** that tags ccs-started sessions. ccs sets
    `ANTHROPIC_AUTH_TOKEN=ccs-internal-managed`; the hook writes a marker named after the
    session id, holding the ccs profile (`profile=claude`) and, when browser tools were live,
@@ -37,7 +39,8 @@ while leaving native `claude` untouched.
 4. **Shell-profile `PATH` line** so the shims resolve ahead of the real binaries.
 
 The shims are transparent for non-ccs use: a fresh `claude`, a native `--resume`, and any
-`ccs` call without `--browser` `exec` the real binary unchanged.
+`ccs` call without `--browser` `exec` the real binary unchanged. A `ccs … --browser` call
+stays alive as the parent of the real `ccs`, so it can close Chrome when that exits.
 
 ## Requirements
 
@@ -145,10 +148,20 @@ Chrome when no `user_data_dir` is configured — ccs would then fall back to you
 Chrome profile, which should not be opened to DevTools unattended. Run `ccs browser setup`
 once to create the managed profile.
 
+The shim only closes a Chrome it started itself. If something already answers on the
+DevTools port when a `--browser` session launches (a Chrome you opened by hand, say), it is
+left running. State lives in `~/.herdr-shims/browser/<port>/`: one lease file per running
+`--browser` session (named by the shim's PID) and an `owned` marker while the shim's own
+Chrome runs. The last session to exit, or to hang up when its terminal closes, sends that
+Chrome `SIGTERM`, which shuts it down cleanly. Leases of sessions that were killed outright
+(`kill -9`) are cleared the next time a `--browser` session exits. `herdr-ccs status` shows
+each port's owner and live session count.
+
 ## Caveats
 
-- `install` rewrites `settings.json` with 2-space indentation (a whitespace-only reformat).
-  A backup is written to `settings.json.herdr-ccs.bak`.
+- When `install` has to add its hook, it rewrites `settings.json` with 2-space indentation
+  (a whitespace-only reformat) and writes a backup to `settings.json.herdr-ccs.bak`. When the
+  hook is already there, `settings.json` is left untouched.
 - Restore redirection assumes Herdr resolves `claude` via `PATH` (it sends the resume
   command to an interactive login pane shell, which sources your profile). If a future
   Herdr version pins an absolute path, the shim will not intercept restore.
@@ -162,7 +175,7 @@ once to create the managed profile.
   Chrome can't start rewrites it without `browser=1`.
 - Restoring a browser session starts Chrome with its DevTools port open on `127.0.0.1`,
   with no one at the keyboard. Any local process can drive that Chrome profile while it
-  runs; keep sensitive logins out of it and quit it when done.
+  runs; keep sensitive logins out of it. The shim quits it when the restored session exits.
 
 ## License
 

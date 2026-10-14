@@ -11,8 +11,9 @@
 #        - on `--resume <id>`, routes through `ccs <profile> [--browser] --resume` iff <id>
 #          was a ccs-started session, else runs the real claude binary (native stays native)
 #   2. A PATH shim (~/.herdr-shims/ccs) that starts the ccs-managed Chrome before a
-#      `--browser` launch. ccs only exposes its browser MCP tools when Chrome already
-#      answers on the DevTools port at launch, and never starts Chrome itself.
+#      `--browser` launch, and quits it when the last `--browser` session using it exits.
+#      ccs only exposes its browser MCP tools when Chrome already answers on the DevTools
+#      port at launch, and never starts Chrome itself.
 #   3. A Claude Code SessionStart hook that tags ccs-started sessions
 #      (detected via ANTHROPIC_AUTH_TOKEN=ccs-internal-managed) under the shim's markers dir,
 #      recording the ccs profile and whether browser tools were live, so resume replays both.
@@ -33,6 +34,7 @@ SHIM_DIR="${HERDR_CCS_SHIM_DIR:-$HOME/.herdr-shims}"
 SHIM="$SHIM_DIR/claude"
 CCS_SHIM="$SHIM_DIR/ccs"
 MARK_DIR="$SHIM_DIR/ccs-sessions"
+BROWSER_DIR="$SHIM_DIR/browser"
 CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 HOOK="$CFG_DIR/hooks/ccs-session-marker.sh"
 SETTINGS="$CFG_DIR/settings.json"
@@ -135,10 +137,12 @@ write_ccs_shim() {
   mkdir -p "$SHIM_DIR"
   { printf '#!/bin/sh\n# Managed by herdr-ccs. Do not edit; run `herdr-ccs install` to regenerate.\n'
     printf "SHIM_DIR='%s'\n" "$SHIM_DIR"
+    printf "BROWSER_DIR='%s'\n" "$BROWSER_DIR"
     cat <<'EOF'
 # ccs only exposes its browser MCP tools when Chrome already answers on the DevTools port at
 # launch, and never starts Chrome itself — so bring the managed Chrome up before a
-# `--browser` launch. Everything else passes straight through to the real ccs.
+# `--browser` launch, and quit it again once the last `--browser` session that needed it
+# exits. Everything else passes straight through to the real ccs.
 
 real=""
 ifs=$IFS; IFS=:; set -f
@@ -176,6 +180,23 @@ launch_chrome() { # $1 = port, $2 = user-data dir
   esac
 }
 
+# Per-port state in $BROWSER_DIR/<port>: one lease file per running `--browser` shim (named by
+# its PID), plus `owned` (holding the user-data dir) when this shim started that Chrome. Only an
+# owned Chrome is ever closed, so a Chrome you opened yourself is left alone.
+state=""
+held=0
+starting=0   # 1 between launching Chrome and it answering on the port
+
+lock() { # mkdir is atomic; a lock left by a killed shim is broken after ~12s
+  i=0
+  until mkdir "$state/lock" 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -ge 120 ] && break
+    sleep 0.1
+  done
+  held=1
+}
+unlock() { rmdir "$state/lock" 2>/dev/null || true; held=0; }
+
 ensure_browser() {
   [ "$(cfg_value enabled)" = "false" ] && return 0
   command -v curl >/dev/null 2>&1 || { echo "herdr-ccs: curl not found; not starting Chrome" >&2; return 0; }
@@ -185,33 +206,94 @@ ensure_browser() {
   case "$dir" in "~"/*) dir="$HOME/${dir#"~/"}" ;; esac
   probe="http://127.0.0.1:$port/json/version"
 
-  curl -sf -m 1 "$probe" >/dev/null 2>&1 && return 0
+  state="$BROWSER_DIR/$port"
+  mkdir -p "$state/leases" || { state=""; return 0; }
+  lock
+  : > "$state/leases/$$"
+  curl -sf -m 1 "$probe" >/dev/null 2>&1 && { unlock; return 0; }
+  # Nothing answers, so any `owned` marker is stale (that Chrome was quit or crashed).
+  rm -f "$state/owned"
   # With no managed dir ccs falls back to your everyday Chrome profile; never open that one
   # to DevTools unattended.
   if [ -z "$dir" ]; then
     echo "herdr-ccs: no browser user_data_dir configured; run \`ccs browser setup\`" >&2
-    return 0
+    unlock; return 0
   fi
-  launch_chrome "$port" "$dir" || { echo "herdr-ccs: could not start Chrome" >&2; return 0; }
+  launch_chrome "$port" "$dir" || { echo "herdr-ccs: could not start Chrome" >&2; unlock; return 0; }
+  printf '%s\n' "$dir" > "$state/owned"
+  starting=1
+  # Hold the lock while Chrome comes up, so a parallel `--browser` launch doesn't start a second one.
   i=0
   while [ "$i" -lt 40 ]; do
-    curl -sf -m 1 "$probe" >/dev/null 2>&1 && return 0
+    curl -sf -m 1 "$probe" >/dev/null 2>&1 && { starting=0; unlock; return 0; }
     sleep 0.25
     i=$((i + 1))
   done
+  starting=0
+  unlock
   echo "herdr-ccs: Chrome did not answer on 127.0.0.1:$port within 10s; browser tools will be missing" >&2
 }
 
+chrome_pids() { # $1 = port, $2 = user-data dir; the browser process only, not its helpers
+  ps -A -o pid= -o args= | P="--remote-debugging-port=$1 " D="--user-data-dir=$2 " awk '
+    { s = $0 " " }
+    index(s, ENVIRON["P"]) && index(s, ENVIRON["D"]) && !index(s, "--type=") { print $1 }'
+}
+
+close_chrome() { # $1 = port, $2 = user-data dir; SIGTERM lets Chrome shut down cleanly
+  pids="$(chrome_pids "$1" "$2")"
+  # `open -gna` returns before Chrome's process exists, so a session ended mid-launch waits for it.
+  i=0
+  while [ -z "$pids" ] && [ "$starting" -eq 1 ] && [ "$i" -lt 40 ]; do
+    sleep 0.25; i=$((i + 1))
+    pids="$(chrome_pids "$1" "$2")"
+  done
+  # shellcheck disable=SC2086 # one PID per word
+  [ -z "$pids" ] || kill -TERM $pids 2>/dev/null || true
+}
+
+# shellcheck disable=SC2329 # runs from the EXIT trap
+release_browser() {
+  trap '' HUP INT TERM   # a second signal (a closing terminal sends several) must not cut this short
+  [ -n "$state" ] || return 0
+  [ "$held" -eq 1 ] || lock   # a signal can land while ensure_browser holds the lock
+  rm -f "$state/leases/$$"
+  for f in "$state/leases"/*; do
+    [ -e "$f" ] || continue
+    if kill -0 "${f##*/}" 2>/dev/null; then unlock; return 0; fi
+    rm -f "$f"   # lease of a shim that died without cleaning up
+  done
+  if [ -f "$state/owned" ]; then
+    close_chrome "${state##*/}" "$(cat "$state/owned")"
+    rm -f "$state/owned"
+  fi
+  unlock
+}
+
+browser=0
 for a in "$@"; do
   case "$a" in
     --) break ;;
-    --browser) ensure_browser; break ;;
+    --browser) browser=1; break ;;
   esac
 done
-exec "$real" "$@"
+[ "$browser" -eq 1 ] || exec "$real" "$@"
+
+# A `--browser` session holds a lease: stay alive as ccs's parent to release it on exit. The
+# traps go in first, so a hangup while Chrome is still starting doesn't leave it running.
+trap release_browser EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+ensure_browser
+if [ -z "$state" ]; then trap - EXIT HUP INT TERM; exec "$real" "$@"; fi
+"$real" "$@"
+exit $?
 EOF
-  } > "$CCS_SHIM"
-  chmod +x "$CCS_SHIM"
+  } > "$CCS_SHIM.tmp.$$"
+  chmod +x "$CCS_SHIM.tmp.$$"
+  # Replace, never rewrite in place: a running `--browser` shim is still reading its script.
+  mv -f "$CCS_SHIM.tmp.$$" "$CCS_SHIM"
 }
 
 write_hook() {
@@ -268,12 +350,12 @@ EOF
 patch_settings() { # $1 = add|remove
   PY="$(python_bin)" || die "python3 required to edit settings.json"
   [ -f "$SETTINGS" ] || { mkdir -p "$CFG_DIR"; printf '{}\n' > "$SETTINGS"; }
-  cp "$SETTINGS" "$SETTINGS.herdr-ccs.bak"
   "$PY" - "$1" "$SETTINGS" "$HOOK_CMD" <<'PY'
-import json, sys
+import copy, json, shutil, sys
 action, path, cmd = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(path, encoding="utf-8") as f:
     data = json.load(f)
+before = copy.deepcopy(data)
 hooks = data.setdefault("hooks", {})
 arr = hooks.setdefault("SessionStart", [])
 
@@ -295,6 +377,9 @@ else:  # remove — strip only our command, preserve any co-located hooks
     if not hooks:
         data.pop("hooks", None)
 
+if data == before:
+    sys.exit(0)  # hook already in the wanted state: leave settings.json untouched
+shutil.copyfile(path, path + ".herdr-ccs.bak")
 with open(path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
@@ -345,14 +430,16 @@ cmd_install() {
   write_ccs_shim
   write_hook
   patch_settings add
+  if grep -qF 'export CCS_CLAUDE_PATH=' "$prof" 2>/dev/null; then prof_note="block already present"
+  else prof_note="PATH + CCS_CLAUDE_PATH block appended"; fi
   add_path "$prof" "$real"
   herdr_precheck
   log "installed."
   log "  shim:        $SHIM  (real claude: $real)"
-  log "  ccs shim:    $CCS_SHIM  (starts Chrome for --browser)"
+  log "  ccs shim:    $CCS_SHIM  (starts Chrome for --browser, quits it after the last one)"
   log "  marker hook: $HOOK"
-  log "  settings:    $SETTINGS  (backup: $SETTINGS.herdr-ccs.bak)"
-  log "  profile:     $prof  (PATH + CCS_CLAUDE_PATH block appended)"
+  log "  settings:    $SETTINGS  (backup on change: $SETTINGS.herdr-ccs.bak)"
+  log "  profile:     $prof  ($prof_note)"
   log ""
   log "next: open a new shell (or: source '$prof'), then verify:"
   log "  which claude   # expect: $SHIM"
@@ -370,7 +457,7 @@ cmd_uninstall() {
   fi
   rm -f "$SHIM" "$CCS_SHIM" "$HOOK"
   if [ "$purge" -eq 1 ]; then
-    rm -rf "$MARK_DIR"
+    rm -rf "$MARK_DIR" "$BROWSER_DIR"
     rmdir "$SHIM_DIR" 2>/dev/null || true
     log "uninstalled (purged shim dir + session markers)."
   else
@@ -396,6 +483,15 @@ cmd_status() {
   n="$( ls -1 "$MARK_DIR" 2>/dev/null | wc -l | tr -d ' ' )"
   nb="$( grep -lx 'browser=1' "$MARK_DIR"/* 2>/dev/null | wc -l | tr -d ' ' )"
   log "  info  tagged ccs sessions: ${n:-0} (with browser: ${nb:-0})"
+  for s in "$BROWSER_DIR"/*; do
+    [ -d "$s" ] || continue
+    live=0
+    for f in "$s"/leases/*; do
+      [ -e "$f" ] && kill -0 "${f##*/}" 2>/dev/null && live=$((live + 1))
+    done
+    owned=no; [ -f "$s/owned" ] && owned=yes
+    log "  info  Chrome :${s##*/}: started by shim: $owned, live --browser sessions: $live"
+  done
   log "  info  'claude' resolves here to: $(command -v claude 2>/dev/null || echo none)"
 }
 
