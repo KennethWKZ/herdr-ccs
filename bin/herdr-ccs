@@ -303,10 +303,13 @@ write_hook() {
     cat <<'EOF'
 input="$(cat)"
 [ "${ANTHROPIC_AUTH_TOKEN:-}" = "ccs-internal-managed" ] || exit 0
-sid=""
-if command -v python3 >/dev/null 2>&1; then
-  sid="$(printf '%s' "$input" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)"
-fi
+# session_id from the hook input, in plain sh: no python3 (on a Mac without the Command Line Tools,
+# /usr/bin/python3 is a stub that opens an install dialog and the session went untagged). Claude Code's
+# session ids are UUIDs, and the id names a file under MARK_DIR, so only [A-Za-z0-9-] is accepted; a key
+# inside another string value is preceded by \" and never matches.
+sid="$(printf '%s' "$input" | tr '\n\r' '  ' \
+  | sed -n 's/.*[{,][[:space:]]*"session_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9-]\{1,128\}\)".*/\1/p' \
+  | head -n 1)"
 [ -n "$sid" ] || exit 0
 
 # ccs exports no profile name, so read it off the launching `ccs <profile> ...` process.

@@ -47,7 +47,7 @@ stays alive as the parent of the real `ccs`, so it can close Chrome when that ex
 - [Herdr](https://herdr.dev) installed, with the Claude integration:
   `herdr integration install claude`
 - `ccs` (`@kaitranntt/ccs`) on `PATH`
-- `python3` (marker hook + `settings.json` editing)
+- `python3`, only for `install` and `uninstall` (they edit `settings.json`); the marker hook runs without it
 - zsh or bash (fish/others: set `HERDR_CCS_PROFILE` or add the shim dir to `PATH` manually)
 
 ## Install
@@ -176,6 +176,16 @@ each port's owner and live session count.
 - Restoring a browser session starts Chrome with its DevTools port open on `127.0.0.1`,
   with no one at the keyboard. Any local process can drive that Chrome profile while it
   runs; keep sensitive logins out of it. The shim quits it when the restored session exits.
+
+## Tests
+
+```sh
+sh test/test_session_marker.sh
+```
+
+Installs into temp folders (nothing real is touched) and checks the marker hook under `sh`, `bash` and `dash`
+with no `python3` on `PATH`: compact and pretty-printed input, the browser flag, native sessions left untagged,
+and ids that aren't UUID-shaped refused, so no marker lands outside the markers folder.
 
 ## License
 
