@@ -8,7 +8,7 @@
 
 id = "kennethwkz.herdr-ccs"
 name = "herdr-ccs"
-version = "0.3.1"
+version = "0.4.0"
 min_herdr_version = "0.7.0"
 description = "Make `ccs claude` behave like native Claude Code in Herdr: pane detection, launcher-aware session restore through ccs, and the ccs-managed Chrome started for `--browser` and quit after the last session."
 platforms = ["macos", "linux"]
