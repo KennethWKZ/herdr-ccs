@@ -1,0 +1,16 @@
+[package]
+name = "herdr-ccs-marker"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.70"
+publish = false
+description = "herdr-ccs's Claude Code SessionStart marker hook, without a shell or ps: tags ccs-started sessions for launcher-aware restore."
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -36,6 +36,10 @@ while leaving native `claude` untouched.
    `ANTHROPIC_AUTH_TOKEN=ccs-internal-managed`; the hook writes a marker named after the
    session id, holding the ccs profile (`profile=claude`) and, when browser tools were live,
    `browser=1`. Bare `claude` never sets that token, so tagging is unambiguous.
+   Claude Code waits for this hook at every session start, resume, `/clear` and compact, so it's
+   built to be quick: when Rust is installed, `herdr plugin install` builds a small Rust marker
+   (`marker/`, no dependencies) and the hook runs it, about 10 ms. Without Rust the hook does the same
+   work in sh with one `ps` call (about 0.1 to 0.5 s on a busy Mac; 0.3.x took 1 to 1.6 s).
 4. **Shell-profile `PATH` line** so the shims resolve ahead of the real binaries.
 
 The shims are transparent for non-ccs use: a fresh `claude`, a native `--resume`, and any
@@ -48,6 +52,10 @@ stays alive as the parent of the real `ccs`, so it can close Chrome when that ex
   `herdr integration install claude`
 - `ccs` (`@kaitranntt/ccs`) on `PATH`
 - `python3`, only for `install` and `uninstall` (they edit `settings.json`); the marker hook runs without it
+- Optional: Rust (`cargo`) when the plugin is installed, for the fast marker hook. The `[[build]]` step
+  (`bin/build-marker.sh`) skips it without cargo and never fails the install; the install action copies the
+  binary to `~/.herdr-shims/bin/herdr-ccs-marker`, out of the plugin folder herdr replaces on each update.
+  After installing Rust later, reinstall the plugin and run the install action again.
 - zsh or bash (fish/others: set `HERDR_CCS_PROFILE` or add the shim dir to `PATH` manually)
 
 ## Install
@@ -183,9 +191,11 @@ each port's owner and live session count.
 sh test/test_session_marker.sh
 ```
 
-Installs into temp folders (nothing real is touched) and checks the marker hook under `sh`, `bash` and `dash`
-with no `python3` on `PATH`: compact and pretty-printed input, the browser flag, native sessions left untagged,
-and ids that aren't UUID-shaped refused, so no marker lands outside the markers folder.
+Installs into temp folders (nothing real is touched) and checks the marker hook in both forms, its shell
+fallback and the Rust marker (built with cargo when it's there), under `sh`, `bash` and `dash` with no `python3`
+on `PATH`: compact and pretty-printed input, the browser flag, native sessions left untagged, ids that aren't
+UUID-shaped refused (so no marker lands outside the markers folder), and the profile read off a fake `ccs`
+launcher one or more parents up. `cargo test --manifest-path marker/Cargo.toml` runs the marker's unit tests.
 
 ## License
 

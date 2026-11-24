@@ -13,6 +13,10 @@ min_herdr_version = "0.7.0"
 description = "Make `ccs claude` behave like native Claude Code in Herdr: pane detection, launcher-aware session restore through ccs, and the ccs-managed Chrome started for `--browser` and quit after the last session."
 platforms = ["macos", "linux"]
 
+# Builds the Rust marker hook when cargo is available (never fails the install; the hook falls back to sh).
+[[build]]
+command = ["sh", "bin/build-marker.sh"]
+
 [[actions]]
 id = "install"
 title = "herdr-ccs: install"

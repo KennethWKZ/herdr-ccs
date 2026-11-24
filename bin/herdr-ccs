@@ -38,6 +38,9 @@ BROWSER_DIR="$SHIM_DIR/browser"
 CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 HOOK="$CFG_DIR/hooks/ccs-session-marker.sh"
 SETTINGS="$CFG_DIR/settings.json"
+MARKER_BIN="$SHIM_DIR/bin/herdr-ccs-marker"
+# Where `[[build]]` (bin/build-marker.sh) leaves the Rust marker inside the plugin folder.
+MARKER_BUILD="${HERDR_CCS_MARKER_BUILD:-$(cd "$(dirname "$0")/.." && pwd)/marker/target/release/herdr-ccs-marker}"
 HOOK_CMD="bash '$HOOK'"
 BEGIN="# >>> herdr-ccs shim >>>"
 END="# <<< herdr-ccs shim <<<"
@@ -296,11 +299,30 @@ EOF
   mv -f "$CCS_SHIM.tmp.$$" "$CCS_SHIM"
 }
 
+# The Rust marker, when [[build]] made one: copied out of the plugin folder (herdr replaces that folder on each
+# update and later deletes the old one), so the hook always finds it at the same path. A stale copy is removed
+# when there's no build, so hook and binary never come from different versions.
+install_marker() {
+  if [ -x "$MARKER_BUILD" ]; then
+    mkdir -p "$(dirname "$MARKER_BIN")"
+    cp "$MARKER_BUILD" "$MARKER_BIN.tmp.$$" && chmod 755 "$MARKER_BIN.tmp.$$"
+    mv -f "$MARKER_BIN.tmp.$$" "$MARKER_BIN"   # replace, never rewrite a binary that may be running
+    echo "rust"
+  else
+    rm -f "$MARKER_BIN"
+    echo "shell (no Rust build: install cargo and reinstall the plugin for the fast marker)"
+  fi
+}
+
 write_hook() {
   mkdir -p "$(dirname "$HOOK")" "$MARK_DIR"
   { printf '#!/bin/sh\n# Managed by herdr-ccs. Tags ccs-started Claude Code sessions for launcher-aware restore.\n'
     printf "MARK_DIR='%s'\n" "$MARK_DIR"
+    printf "MARKER_BIN='%s'\n" "$MARKER_BIN"
     cat <<'EOF'
+# The Rust marker (built at plugin install when cargo is there) does all of this in a few milliseconds; the
+# shell below is the fallback.
+[ -x "$MARKER_BIN" ] && exec "$MARKER_BIN" "$MARK_DIR"
 input="$(cat)"
 [ "${ANTHROPIC_AUTH_TOKEN:-}" = "ccs-internal-managed" ] || exit 0
 # session_id from the hook input, in plain sh: no python3 (on a Mac without the Command Line Tools,
@@ -312,31 +334,24 @@ sid="$(printf '%s' "$input" | tr '\n\r' '  ' \
   | head -n 1)"
 [ -n "$sid" ] || exit 0
 
-# ccs exports no profile name, so read it off the launching `ccs <profile> ...` process.
-# Only argv[0]/argv[1] count as the ccs binary: claude's own argv carries free text.
-ccs_profile() {
-  pid=$PPID
-  for _ in 1 2 3 4 5 6 7 8; do
-    case "$pid" in ''|0|1) return 0 ;; esac
-    set -f
-    # shellcheck disable=SC2046
-    set -- $(ps -o args= -p "$pid" 2>/dev/null)
-    set +f
-    case "${1:-}" in
-      ccs|*/ccs) shift ;;
-      *) case "${2:-}" in
-           ccs|*/ccs) shift 2 ;;
-           *) pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"; continue ;;
-         esac ;;
-    esac
-    for a in "$@"; do
-      case "$a" in -*) ;; *) printf '%s\n' "$a"; return 0 ;; esac
-    done
-    return 0
-  done
-}
-
-profile="$(ccs_profile)"
+# ccs exports no profile name, so read it off the launching `ccs <profile> ...` process: up to 8 parents,
+# where argv[0] or argv[1] is the ccs binary (claude's own argv carries free text), then the first argument not
+# starting with -. One ps for the whole process table, walked in awk: a ps per parent cost 0.1-0.5 s each here.
+profile="$(ps -A -o pid=,ppid=,args= 2>/dev/null | awk -v start="$PPID" '
+  { pid = $1; ppid[pid] = $2; $1 = ""; $2 = ""; args[pid] = $0 }
+  END {
+    p = start
+    for (level = 0; level < 8; level++) {
+      if (p == "" || p == 0 || p == 1 || !(p in args)) exit
+      n = split(args[p], w, /[ \t]+/)
+      k = 0; for (i = 1; i <= n; i++) if (w[i] != "") word[++k] = w[i]
+      if (word[1] ~ /(^|\/)ccs$/) first = 2
+      else if (k >= 2 && word[2] ~ /(^|\/)ccs$/) first = 3
+      else { p = ppid[p]; delete word; continue }
+      for (i = first; i <= k; i++) if (word[i] !~ /^-/) { print word[i]; exit }
+      exit
+    }
+  }')"
 case "$profile" in *[!A-Za-z0-9._-]*) profile="" ;; esac
 
 mkdir -p "$MARK_DIR"
@@ -431,6 +446,7 @@ cmd_install() {
   [ -n "$(detect_real_ccs)" ] || warn "'ccs' not on PATH — install ccs before starting ccs sessions"
   write_shim "$real"
   write_ccs_shim
+  marker_kind="$(install_marker)"
   write_hook
   patch_settings add
   if grep -qF 'export CCS_CLAUDE_PATH=' "$prof" 2>/dev/null; then prof_note="block already present"
@@ -440,7 +456,7 @@ cmd_install() {
   log "installed."
   log "  shim:        $SHIM  (real claude: $real)"
   log "  ccs shim:    $CCS_SHIM  (starts Chrome for --browser, quits it after the last one)"
-  log "  marker hook: $HOOK"
+  log "  marker hook: $HOOK  (marker: $marker_kind)"
   log "  settings:    $SETTINGS  (backup on change: $SETTINGS.herdr-ccs.bak)"
   log "  profile:     $prof  ($prof_note)"
   log ""
@@ -458,7 +474,8 @@ cmd_uninstall() {
   else
     warn "shell profile not auto-detected; remove the '$BEGIN' block manually if present"
   fi
-  rm -f "$SHIM" "$CCS_SHIM" "$HOOK"
+  rm -f "$SHIM" "$CCS_SHIM" "$HOOK" "$MARKER_BIN"
+  rmdir "$(dirname "$MARKER_BIN")" 2>/dev/null || true
   if [ "$purge" -eq 1 ]; then
     rm -rf "$MARK_DIR" "$BROWSER_DIR"
     rmdir "$SHIM_DIR" 2>/dev/null || true
@@ -478,6 +495,7 @@ cmd_status() {
   mark "$( [ -x "$SHIM" ] && echo x || true )"                          "shim            $SHIM"
   mark "$( [ -x "$CCS_SHIM" ] && echo x || true )"                      "ccs shim        $CCS_SHIM"
   mark "$( [ -x "$HOOK" ] && echo x || true )"                          "marker hook     $HOOK"
+  mark "$( [ -x "$MARKER_BIN" ] && echo x || true )"                    "rust marker     $MARKER_BIN$( [ -x "$MARKER_BIN" ] || echo '  (shell fallback in use)')"
   mark "$( grep -qF "$HOOK" "$SETTINGS" 2>/dev/null && echo x || true )" "SessionStart    $SETTINGS"
   mark "$( grep -qF "$BEGIN" "$prof" 2>/dev/null && echo x || true )"    "profile PATH    $prof"
   mark "$( grep -qF 'export CCS_CLAUDE_PATH=' "$prof" 2>/dev/null && echo x || true )" "profile ENV     CCS_CLAUDE_PATH pin"
